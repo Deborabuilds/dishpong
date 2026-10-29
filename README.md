@@ -14,6 +14,10 @@ A Pong game played by a small simulated culture of spiking neurons, inspired by 
 
 This is a simplified model, not real neuron biology: hits and misses change the weights directly, like a reward and penalty rule.
 
+## Credits
+
+This is an independent implementation, written from scratch. The idea was inspired by the "DishBrain" experiment by Cortical Labs (Kagan et al., 2022), in which cultured neurons learned to play Pong, and by a video from Instagram account [@vibecodingiseasy](https://www.instagram.com/vibecodingiseasy/).
+
 ## Controls
 
 - Speed buttons (1x to 256x) let you watch the dish learn faster.
