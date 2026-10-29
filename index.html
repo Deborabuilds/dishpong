@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DishPong</title>
+<style>
+:root{--bg:#0b0f14;--panel:#121923;--ink:#d8e3ee;--dim:#7d8ea1;--calm:#5ee6c1;--noise:#ff5a6e;--line:#223042}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,sans-serif}
+main{max-width:1100px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 2px;font-weight:650}
+.sub{color:var(--dim);margin:0 0 14px}
+.grid{display:grid;grid-template-columns:3fr 2fr;gap:12px}
+@media(max-width:760px){.grid{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;position:relative}
+.card h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:0 0 6px;font-weight:600}
+canvas{width:100%;display:block;border-radius:6px;background:#0a0e13}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0}
+button{background:#1a2431;color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:7px 12px;font:inherit;cursor:pointer}
+button:hover{border-color:#3a5068}
+button.on{background:#173a35;border-color:var(--calm);color:var(--calm)}
+.seg{display:flex;gap:0}
+.seg button{border-radius:0;margin-left:-1px}
+.seg button:first-child{border-radius:7px 0 0 7px;margin-left:0}
+.seg button:last-child{border-radius:0 7px 7px 0}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px}
+@media(max-width:600px){.stats{grid-template-columns:repeat(3,1fr)}}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+.stat b{display:block;font-size:20px;font-variant-numeric:tabular-nums}
+.stat span{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+#state.calm{color:var(--calm)}#state.noise{color:var(--noise)}
+.note{color:var(--dim);font-size:12.5px;margin-top:12px}
+</style>
+</head>
+<body>
+<main>
+  <h1>DishPong</h1>
+  <p class="sub">A small simulated culture of spiking neurons plays Pong. A miss floods it with random noise; a hit gives it a calm, predictable beat. It learns to make the beat happen.</p>
+
+  <div class="bar">
+    <button id="go" class="on">Pause</button>
+    <span class="seg" id="speeds"></span>
+    <button id="me">Play myself</button>
+    <button id="snd">Sound: off</button>
+    <button id="rst">New dish</button>
+  </div>
+
+  <div class="grid">
+    <div class="card"><h2>The game</h2><canvas id="pong" width="600" height="400"></canvas></div>
+    <div class="card"><h2>The dish (sensory → motor)</h2><canvas id="dish" width="400" height="400"></canvas></div>
+  </div>
+
+  <div class="card" style="margin-top:12px"><h2>Hit rate, rolling last 30 rallies</h2><canvas id="chart" width="1000" height="170"></canvas></div>
+
+  <div class="stats">
+    <div class="stat"><span>Rallies</span><b id="sN">0</b></div>
+    <div class="stat"><span>Hits</span><b id="sH">0</b></div>
+    <div class="stat"><span>Hit rate (30)</span><b id="sR">–</b></div>
+    <div class="stat"><span>Best streak</span><b id="sS">0</b></div>
+    <div class="stat"><span>Stimulus</span><b id="state">–</b></div>
+  </div>
+  <p class="note">How it works: the ball's height is delivered as spikes on 16 sensory electrodes. 16 motor neurons each vote for a paddle position. Synapses leave eligibility traces; a hit (calm, predictable input) consolidates the traces that were active, a miss (noise) weakens them and shakes the synapses up in proportion to how often it's failing. Calm → exploit, noise → explore.</p>
+</main>
+
+<script>
+// ==CORE==
+const NS = 16, NM = 16, W = 1.5, H = 1, PAD_H = 0.2, PAD_X = 0.04, BALL_R = 0.022, DT = 0.004;
+const P = {
+  RMAX: 120, SIG: 1.1, TAU_X: 0.025, TAU_M: 0.02, TAU_R: 0.1, TAU_E: 0.15,
+  GAIN: 0.5, GINH: 0.06, MNOISE: 0.6, NOISE_RATE: 60, NOISE_T: 0.9, CALM_T: 0.5,
+  ETA_HIT: 1.5, ETA_MISS: 1.0, JITTER: 0.2, SPEED: 0.85, PAD_V: 1.8, WIN: 30
+};
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+
+class Dish {
+  constructor(seed){ this.seed = seed || (Math.random()*1e9|0); this.reset(); }
+  gauss(){ let u=0; while(!u) u=this.rand(); return Math.sqrt(-2*Math.log(u))*Math.cos(6.283185*this.rand()); }
+  reset(){
+    this.rand = mulberry32(this.seed);
+    this.w = new Float32Array(NS*NM); this.e = new Float32Array(NS*NM);
+    for(let n=0;n<NS*NM;n++) this.w[n] = 0.5 + this.rand();
+    this.normalize();
+    this.x = new Float32Array(NS); this.sSpike = new Uint8Array(NS);
+    this.v = new Float32Array(NM); this.r = new Float32Array(NM); this.mSpike = new Uint8Array(NM);
+    this.hits = 0; this.misses = 0; this.streak = 0; this.best = 0;
+    this.results = []; this.curve = [];
+    this.manualY = 0.5; this.t = 0; this.py = 0.5; this.target = 0.5;
+    this.stim = 'none'; this.stimT = 0; this.beat = 0; this.event = null;
+    this.serve(0.4);
+  }
+  normalize(){
+    for(let j=0;j<NM;j++){
+      let s=0; for(let i=0;i<NS;i++){ const k=i*NM+j; if(this.w[k]<0.02) this.w[k]=0.02; s+=this.w[k]; }
+      const f = NS/s; for(let i=0;i<NS;i++) this.w[i*NM+j]*=f;
+    }
+  }
+  serve(wait){
+    this.bx = W-0.1; this.by = 0.1 + this.rand()*(H-0.2);
+    const a = (this.rand()-0.5)*1.2;
+    this.vx = -P.SPEED*Math.cos(a); this.vy = P.SPEED*Math.sin(a);
+    this.mode = 'wait'; this.timer = wait;
+  }
+  step(){
+    const dt = DT; this.t += dt; this.event = null;
+    if(this.mode==='wait'){
+      this.timer -= dt;
+      if(this.timer<=0){ this.mode='play'; if(this.stim==='noise'){ this.stim='none'; } this.e.fill(0); }
+    } else this.moveBall(dt);
+    if(this.stim==='calm'){ this.stimT -= dt; if(this.stimT<=0) this.stim='none'; }
+    this.neurons(dt);
+    if(this.manual) this.target = this.manualY;
+    const d = this.target - this.py, m = (this.manual?4:P.PAD_V)*dt;
+    this.py += d>m ? m : d<-m ? -m : d;
+    const lo=PAD_H/2, hi=H-PAD_H/2; this.py = this.py<lo?lo:this.py>hi?hi:this.py;
+  }
+  moveBall(dt){
+    this.bx += this.vx*dt; this.by += this.vy*dt;
+    if(this.by<BALL_R){ this.by=BALL_R; this.vy=Math.abs(this.vy); }
+    if(this.by>H-BALL_R){ this.by=H-BALL_R; this.vy=-Math.abs(this.vy); }
+    if(this.bx>W-BALL_R){ this.bx=W-BALL_R; this.vx=-Math.abs(this.vx); }
+    if(this.vx<0 && this.bx<=PAD_X+BALL_R){
+      const off = (this.by-this.py)/(PAD_H/2+BALL_R);
+      if(Math.abs(off)<=1){
+        this.vx = Math.abs(this.vx); this.vy += 0.35*off*P.SPEED;
+        const lim=0.8*P.SPEED; this.vy = Math.max(-lim,Math.min(lim,this.vy));
+        const s = Math.hypot(this.vx,this.vy); this.vx*=P.SPEED/s; this.vy*=P.SPEED/s;
+        this.bx = PAD_X+BALL_R+0.001;
+        this.record(true);
+      } else if(this.bx < -0.02) this.record(false);
+    }
+  }
+  record(hit){
+    this.results.push(hit?1:0);
+    if(hit){ this.hits++; this.streak++; if(this.streak>this.best) this.best=this.streak; this.learn(1); this.stim='calm'; this.stimT=P.CALM_T; this.beat=0; }
+    else { this.misses++; this.streak=0; this.learn(-1); this.stim='noise'; this.serve(P.NOISE_T); }
+    const n=this.results.length, k=Math.min(P.WIN,n); let s=0; for(let i=n-k;i<n;i++) s+=this.results[i];
+    this.curve.push(s/k); this.event = hit?'hit':'miss';
+  }
+  recentMiss(){ const n=this.results.length,k=Math.min(P.WIN,n); if(!k) return 0.8; let s=0; for(let i=n-k;i<n;i++) s+=1-this.results[i]; return s/k; }
+  learn(sign){
+    if(this.manual){ this.e.fill(0); return; }
+    const w=this.w, e=this.e, N=NS*NM; let m=1e-6;
+    for(let n=0;n<N;n++) if(e[n]>m) m=e[n];
+    const k = sign*(sign>0?P.ETA_HIT:P.ETA_MISS)/m;
+    for(let n=0;n<N;n++) w[n]+=k*e[n];
+    if(sign<0){ const sg=P.JITTER*this.recentMiss(); for(let n=0;n<N;n++) w[n]*=Math.max(0.1,1+sg*this.gauss()); }
+    this.normalize(); e.fill(0);
+  }
+  neurons(dt){
+    const noise=this.stim==='noise', calm=this.stim==='calm';
+    let beat=false;
+    if(calm){ this.beat+=dt; if(this.beat>=0.1){ this.beat-=0.1; beat=true; } }
+    const dX=Math.exp(-dt/P.TAU_X), dR=Math.exp(-dt/P.TAU_R), dE=Math.exp(-dt/P.TAU_E), unit=(H)/(NS-1);
+    const x=this.x, ss=this.sSpike, rand=this.rand;
+    for(let i=0;i<NS;i++){
+      let rate;
+      if(noise) rate=P.NOISE_RATE;
+      else { const d=(this.by-i*unit)/unit; rate=P.RMAX*Math.exp(-d*d/(2*P.SIG*P.SIG)); }
+      const sp = beat || rand()<rate*dt;
+      x[i]*=dX; if(sp) x[i]+=1; ss[i]=sp?1:0;
+    }
+    let rsum=0; for(let j=0;j<NM;j++) rsum+=this.r[j];
+    const inh=P.GINH*rsum/NM*NM/4, w=this.w, e=this.e, v=this.v, r=this.r, ms=this.mSpike;
+    for(let n=0;n<NS*NM;n++) e[n]*=dE;
+    const nz = P.MNOISE*Math.sqrt(dt)*(noise?3:1);
+    for(let j=0;j<NM;j++){
+      let I=0; for(let i=0;i<NS;i++) I+=w[i*NM+j]*x[i];
+      v[j] += dt/P.TAU_M*(-v[j]+P.GAIN*I-inh) + nz*this.gauss();
+      if(v[j]<-0.5) v[j]=-0.5;
+      r[j]*=dR; ms[j]=0;
+      if(v[j]>=1){
+        v[j]=0; ms[j]=1; r[j]+=1;
+        for(let i=0;i<NS;i++) e[i*NM+j]+=x[i];
+      }
+    }
+    let q=0,qy=0;
+    for(let j=0;j<NM;j++){ const a=r[j]*r[j]; q+=a; qy+=a*(j/(NM-1))*H; }
+    if(q>0.2) this.target = qy/q;
+  }
+  rate(){ const n=this.results.length,k=Math.min(P.WIN,n); if(!k) return null; let s=0; for(let i=n-k;i<n;i++) s+=this.results[i]; return s/k; }
+}
+// ==/CORE==
+
+// ---------------- UI ----------------
+if (typeof document !== 'undefined') (function(){
+const $ = id => document.getElementById(id);
+const dish = new Dish();
+let running = true, speed = 4, soundOn = false, ac = null, lastSnd = 0;
+const speeds = [1,4,16,64,256];
+
+const sp = $('speeds');
+speeds.forEach(s => { const b=document.createElement('button'); b.textContent=s+'×'; b.onclick=()=>{speed=s;mark();}; b.dataset.s=s; sp.appendChild(b); });
+function mark(){ [...sp.children].forEach(b=>b.classList.toggle('on',+b.dataset.s===speed)); }
+mark();
+$('go').onclick = () => { running=!running; $('go').textContent=running?'Pause':'Play'; $('go').classList.toggle('on',running); };
+$('rst').onclick = () => { dish.seed=Math.random()*1e9|0; dish.reset(); };
+$('snd').onclick = () => {
+  soundOn=!soundOn; $('snd').textContent='Sound: '+(soundOn?'on':'off'); $('snd').classList.toggle('on',soundOn);
+  if(soundOn && !ac) ac = new (window.AudioContext||window.webkitAudioContext)();
+  if(ac && ac.state==='suspended') ac.resume();
+};
+
+$('me').onclick = () => {
+  dish.manual = !dish.manual; $('me').classList.toggle('on',dish.manual);
+  $('me').textContent = dish.manual ? 'Dish plays' : 'Play myself';
+  if(dish.manual){ speed=1; mark(); }
+  const m=dish.manual; dish.reset(); dish.manual=m;
+};
+const pc = $('pong');
+function setY(clientY){ const r=pc.getBoundingClientRect(); dish.manualY=Math.max(0,Math.min(1,(clientY-r.top)/r.height))*H; }
+pc.addEventListener('mousemove',e=>setY(e.clientY));
+pc.addEventListener('touchmove',e=>{ setY(e.touches[0].clientY); e.preventDefault(); },{passive:false});
+pc.addEventListener('touchstart',e=>setY(e.touches[0].clientY));
+const keys={};
+addEventListener('keydown',e=>{ if(['ArrowUp','ArrowDown','w','s'].includes(e.key)){ keys[e.key]=1; if(dish.manual) e.preventDefault(); } });
+addEventListener('keyup',e=>{ keys[e.key]=0; });
+
+function thump(t0,f,g){
+  const o=ac.createOscillator(), a=ac.createGain();
+  o.type='sine'; o.frequency.setValueAtTime(f,t0); o.frequency.exponentialRampToValueAtTime(f*0.6,t0+0.25);
+  a.gain.setValueAtTime(0,t0); a.gain.linearRampToValueAtTime(g,t0+0.02); a.gain.exponentialRampToValueAtTime(0.001,t0+0.4);
+  o.connect(a).connect(ac.destination); o.start(t0); o.stop(t0+0.45);
+}
+function playHit(){ const t=ac.currentTime; thump(t,110,0.22); thump(t+0.16,82,0.16); }
+function playMiss(){
+  const t=ac.currentTime, len=ac.sampleRate*0.7, buf=ac.createBuffer(1,len,ac.sampleRate), d=buf.getChannelData(0);
+  for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*(1-i/len);
+  const s=ac.createBufferSource(), f=ac.createBiquadFilter(), g=ac.createGain();
+  f.type='bandpass'; f.frequency.setValueAtTime(3000,t); f.frequency.exponentialRampToValueAtTime(500,t+0.7); f.Q.value=0.7;
+  g.gain.value=0.3; s.buffer=buf; s.connect(f).connect(g).connect(ac.destination); s.start(t);
+}
+function sound(ev){
+  if(!soundOn||!ac||speed>16) return;
+  const now=performance.now(); if(now-lastSnd<250) return; lastSnd=now;
+  ev==='hit'?playHit():playMiss();
+}
+
+function fit(c){ const r=devicePixelRatio||1, w=c.clientWidth, h=w*c.height/c.width; if(c._w!==w){ c._w=w; c.style.height=h+'px'; c.width=w*r; c.height=h*r; c._r=r; } const x=c.getContext('2d'); x.setTransform(c._r,0,0,c._r,0,0); return [x,w,h]; }
+
+let flash=0, flashKind='';
+function drawPong(){
+  const [g,cw,ch]=fit($('pong')); const sx=cw/W, sy=ch/H;
+  g.fillStyle='#0a0e13'; g.fillRect(0,0,cw,ch);
+  const noise=dish.stim==='noise', calm=dish.stim==='calm';
+  if(noise){ for(let k=0;k<260;k++){ g.fillStyle=`rgba(255,90,110,${Math.random()*0.35})`; g.fillRect(Math.random()*cw,Math.random()*ch,2+Math.random()*10,2+Math.random()*3); } }
+  if(calm){ const p=(dish.beat%0.1)/0.1; g.strokeStyle=`rgba(94,230,193,${0.5*(1-p)})`; g.lineWidth=3; g.strokeRect(2,2,cw-4,ch-4); }
+  g.setLineDash([6,8]); g.strokeStyle='#1f2d3d'; g.beginPath(); g.moveTo(cw/2,0); g.lineTo(cw/2,ch); g.stroke(); g.setLineDash([]);
+  g.fillStyle=noise?'#ff5a6e':'#5ee6c1';
+  const ph=PAD_H*sy; g.fillRect(PAD_X*sx-6, dish.py*sy-ph/2, 6, ph);
+  g.fillStyle='#e8f0f8'; g.beginPath(); g.arc(dish.bx*sx, dish.by*sy, BALL_R*sy, 0, 7); g.fill();
+  g.font='600 13px system-ui'; g.fillStyle=noise?'#ff5a6e':calm?'#5ee6c1':'#7d8ea1';
+  g.fillText(noise?'MISS — noise':calm?'HIT — calm beat':'playing', 12, 22);
+}
+function drawDish(){
+  const [g,cw,ch]=fit($('dish'));
+  g.fillStyle='#0a0e13'; g.fillRect(0,0,cw,ch);
+  const cx=cw/2, cy=ch/2, R=Math.min(cw,ch)/2-6;
+  g.strokeStyle='#223042'; g.lineWidth=2; g.beginPath(); g.arc(cx,cy,R,0,7); g.stroke();
+  const ax=cx-R*0.62, bx=cx+R*0.62, top=cy-R*0.78, bot=cy+R*0.78;
+  const ys=i=>top+(bot-top)*i/(NS-1), ym=j=>top+(bot-top)*j/(NM-1);
+  let mx=0; for(let n=0;n<NS*NM;n++) if(dish.w[n]>mx) mx=dish.w[n];
+  for(let i=0;i<NS;i++) for(let j=0;j<NM;j++){
+    const a=dish.w[i*NM+j]/mx; if(a<0.25) continue;
+    g.strokeStyle=`rgba(94,230,193,${Math.pow(a,2.5)*0.55})`; g.lineWidth=0.5+a*1.6;
+    g.beginPath(); g.moveTo(ax,ys(i)); g.lineTo(bx,ym(j)); g.stroke();
+  }
+  for(let i=0;i<NS;i++){ const a=Math.min(1,dish.x[i]/2.5); g.fillStyle=`rgba(255,${200-a*0|0},${120+a*60|0},${0.25+0.75*a})`; g.fillStyle=`rgba(240,200,110,${0.25+0.75*a})`; g.beginPath(); g.arc(ax,ys(i),4+a*3,0,7); g.fill(); }
+  for(let j=0;j<NM;j++){ const a=Math.min(1,dish.r[j]/3); g.fillStyle=`rgba(94,230,193,${0.2+0.8*a})`; g.beginPath(); g.arc(bx,ym(j),4+a*4,0,7); g.fill(); }
+  g.fillStyle='#7d8ea1'; g.font='11px system-ui'; g.textAlign='center';
+  g.fillText('sensory (ball height)',ax,bot+22); g.fillText('motor (paddle pos)',bx,bot+22); g.textAlign='left';
+  const ty=top+(bot-top)*dish.target/H; g.fillStyle='#fff'; g.fillRect(bx+14,ty-1.5,10,3);
+}
+function drawChart(){
+  const [g,cw,ch]=fit($('chart')); g.fillStyle='#0a0e13'; g.fillRect(0,0,cw,ch);
+  const L=36,B=ch-18,T=8,Rr=cw-10, c=dish.curve;
+  g.font='10px system-ui'; g.fillStyle='#7d8ea1'; g.strokeStyle='#1b2736'; g.lineWidth=1;
+  for(let p=0;p<=1.001;p+=0.25){ const y=B-(B-T)*p; g.beginPath(); g.moveTo(L,y); g.lineTo(Rr,y); g.stroke(); g.fillText(Math.round(p*100)+'%',4,y+3); }
+  if(c.length<2) return;
+  const n=c.length, X=i=>L+(Rr-L)*i/(n-1), Y=v=>B-(B-T)*v;
+  g.beginPath(); g.moveTo(X(0),B); c.forEach((v,i)=>g.lineTo(X(i),Y(v))); g.lineTo(X(n-1),B); g.closePath(); g.fillStyle='rgba(94,230,193,0.12)'; g.fill();
+  g.beginPath(); c.forEach((v,i)=>i?g.lineTo(X(i),Y(v)):g.moveTo(X(i),Y(v))); g.strokeStyle='#5ee6c1'; g.lineWidth=2; g.stroke();
+  g.fillStyle='#7d8ea1'; g.fillText('rallies →  '+n, Rr-70, B+13);
+}
+function stats(){
+  $('sN').textContent=dish.results.length; $('sH').textContent=dish.hits;
+  const r=dish.rate(); $('sR').textContent=r==null?'–':Math.round(r*100)+'%'; $('sS').textContent=dish.best;
+  const s=$('state'); s.className=dish.stim==='noise'?'noise':dish.stim==='calm'?'calm':''; s.textContent=dish.stim==='noise'?'Noise':dish.stim==='calm'?'Calm beat':'—';
+}
+
+let last=performance.now(), acc=0;
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  if(dish.manual){ const k=((keys.ArrowDown||keys.s)?1:0)-((keys.ArrowUp||keys.w)?1:0); if(k) dish.manualY=Math.max(0,Math.min(H,dish.manualY+k*dt*1.6)); }
+  if(running){
+    acc += dt*speed/DT; let n=Math.min(acc|0,4000); acc-=n; if(acc>4000) acc=0;
+    while(n--){ dish.step(); if(dish.event) sound(dish.event); }
+  }
+  drawPong(); drawDish(); drawChart(); stats();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.addEventListener('resize',()=>{ ['pong','dish','chart'].forEach(i=>$(i)._w=0); });
+window.__dish = dish;
+})();
+</script>
+</body>
+</html>
